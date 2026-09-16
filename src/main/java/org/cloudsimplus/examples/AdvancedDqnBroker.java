@@ -7,88 +7,64 @@ import org.cloudsimplus.core.CloudSimPlus;
 import org.cloudsimplus.schedulers.cloudlet.CloudletScheduler;
 import org.cloudsimplus.vms.Vm;
 
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 
-public class AdvancedDqnBroker
-        extends DatacenterBrokerSimple {
+/**
+ * Candidate-conditioned hybrid DQN broker.
+ *
+ * The DQN does not override a good scheduling policy with an arbitrary VM.
+ * Instead, a small set of strong VM candidates is ranked using actual
+ * scheduler state, and the DQN learns which candidate rank gives the best
+ * multi-objective reward under the current workload state.
+ */
+public class AdvancedDqnBroker extends DatacenterBrokerSimple {
 
-    private static final double POWER_IDLE =
-            175.0;
+    private static final double POWER_IDLE = 175.0;
+    private static final double POWER_MAX = 375.0;
 
-    private static final double POWER_MAX =
-            375.0;
+    private static final double COST_PER_CPU_SEC = 0.03;
+    private static final double COST_PER_RAM_MB_SEC = 0.0005;
 
-    private static final double COST_PER_CPU_SEC =
-            0.03;
+    private static final double MAX_QUEUE_LENGTH = 1_000.0;
+    private static final double MAX_SYSTEM_WORKLOAD = 80_000_000.0;
+    private static final double MAX_COST_RATE = 1.0;
 
-    private static final double COST_PER_RAM_MB_SEC =
-            0.0005;
-
-    private static final double MAX_REMAINING_WORKLOAD =
-            5_000_000.0;
+    /** Number of good candidate VMs exposed to the DQN action space. */
+    public static final int CANDIDATE_COUNT = 8;
 
     private final DqnAgent dqnAgent;
 
     private DqnState lastState;
-
     private int lastAction = 0;
-
     private Cloudlet lastCloudlet;
 
     public AdvancedDqnBroker(
             CloudSimPlus simulation,
             String name,
             DqnAgent agent) {
-
         super(simulation, name);
-
         this.dqnAgent = agent;
 
-        /*
-         * Important:
-         * Keep the broker alive until the simulation
-         * has no work left.
-         */
         setShutdownWhenIdle(false);
-
-        /*
-         * Do not destroy VMs automatically.
-         */
         setVmDestructionDelay(-1);
-
-        setVmMapper(
-                this::mapTaskWithDqn);
+        setVmMapper(this::mapTaskWithDqn);
     }
 
-    private Vm mapTaskWithDqn(
-            Cloudlet cloudlet) {
-
-        List<Vm> vmList =
-                getVmExecList();
+    private Vm mapTaskWithDqn(Cloudlet cloudlet) {
+        final List<Vm> vmList = getVmExecList();
 
         if (vmList.isEmpty()) {
             return Vm.NULL;
         }
 
-        DqnState currentState =
-                observeState(
-                        vmList,
-                        cloudlet);
+        final DqnState currentState = observeState(vmList, cloudlet);
 
-        /*
-         * Reward previous decision.
-         */
-        if (lastState != null
-                && lastCloudlet != null) {
-
-            double reward =
-                    calculateReward(
-                            lastState,
-                            currentState);
-
-            boolean done =
-                    getCloudletWaitingList()
-                            .isEmpty();
+        /* Reward the previous placement using the real scheduler state. */
+        if (lastState != null && lastCloudlet != null) {
+            final double reward = calculateReward(lastState, currentState);
+            final boolean done = getCloudletWaitingList().isEmpty();
 
             dqnAgent.recordTransition(
                     lastState,
@@ -99,164 +75,94 @@ public class AdvancedDqnBroker
         }
 
         /*
-         * DQN chooses an action.
+         * Build a strong candidate set first. This prevents epsilon-greedy
+         * exploration from sending a task to an obviously overloaded VM.
          */
-        int action =
-                dqnAgent.selectAction(
-                        currentState);
+        final List<Vm> candidates = rankCandidateVms(vmList, cloudlet);
 
-        int preferredIndex =
-                Math.floorMod(
-                        action,
-                        vmList.size());
+        final int action = dqnAgent.selectAction(currentState);
+        final int candidateIndex = Math.floorMod(action, candidates.size());
+        final Vm selectedVm = candidates.get(candidateIndex);
 
-        /*
-         * Use the DQN choice together with
-         * actual scheduler workload.
-         */
-        Vm selectedVm =
-                chooseLeastLoadedVm(
-                        vmList,
-                        preferredIndex,
-                        cloudlet);
-
-        lastState =
-                currentState;
-
-        lastAction =
-                vmList.indexOf(
-                        selectedVm);
-
-        if (lastAction < 0) {
-            lastAction = 0;
-        }
-
-        lastCloudlet =
-                cloudlet;
+        lastState = currentState;
+        lastAction = candidateIndex;
+        lastCloudlet = cloudlet;
 
         return selectedVm;
     }
 
-    private Vm chooseLeastLoadedVm(
+    /**
+     * Ranks VMs by projected completion time plus energy/cost/load penalties.
+     * The DQN then chooses among the best CANDIDATE_COUNT ranks.
+     */
+    private List<Vm> rankCandidateVms(
             List<Vm> vmList,
-            int preferredIndex,
             Cloudlet incomingCloudlet) {
 
-        Vm preferredVm =
-                vmList.get(preferredIndex);
+        final double incomingLength = incomingCloudlet == null
+                ? 0.0
+                : Math.max(0.0, incomingCloudlet.getLength());
 
-        double preferredWorkload =
-                getVmRemainingWorkload(
-                        preferredVm);
+        final double meanUtilization = vmList.stream()
+                .mapToDouble(this::safeUtilization)
+                .average()
+                .orElse(0.0);
 
-        double bestScore =
-                Double.MAX_VALUE;
+        final List<CandidateScore> scored = new ArrayList<>(vmList.size());
 
-        Vm bestVm =
-                preferredVm;
-
-        double maxWorkload =
-                1.0;
+        double maxProjectedTime = 1.0;
+        for (Vm vm : vmList) {
+            final double remaining = getVmRemainingWorkload(vm);
+            final double effectiveMips = Math.max(1.0, vm.getMips());
+            final double projectedTime = (remaining + incomingLength) / effectiveMips;
+            maxProjectedTime = Math.max(maxProjectedTime, projectedTime);
+        }
 
         for (Vm vm : vmList) {
+            final double utilization = safeUtilization(vm);
+            final double remaining = getVmRemainingWorkload(vm);
+            final double effectiveMips = Math.max(1.0, vm.getMips());
+            final double projectedTime = (remaining + incomingLength) / effectiveMips;
 
-            maxWorkload =
-                    Math.max(
-                            maxWorkload,
-                            getVmRemainingWorkload(vm));
+            final double projectedTimeNorm = clamp(projectedTime / maxProjectedTime);
+            final double energyNorm = clamp(
+                    (POWER_IDLE + (POWER_MAX - POWER_IDLE) * utilization)
+                            / POWER_MAX);
+
+            final double costRate =
+                    utilization * COST_PER_CPU_SEC
+                            + COST_PER_RAM_MB_SEC * 1024.0;
+            final double costNorm = clamp(costRate / MAX_COST_RATE);
+
+            final double imbalancePenalty = Math.abs(utilization - meanUtilization);
+
+            /*
+             * These coefficients are deliberately multi-objective:
+             * QoS/latency dominates, while utilization/energy/cost prevent
+             * the policy from simply selecting the fastest VM every time.
+             */
+            final double score =
+                    0.55 * projectedTimeNorm
+                            + 0.20 * utilization
+                            + 0.15 * energyNorm
+                            + 0.10 * costNorm
+                            + 0.10 * imbalancePenalty;
+
+            scored.add(new CandidateScore(vm, score));
         }
 
-        for (int i = 0;
-             i < vmList.size();
-             i++) {
+        scored.sort(
+                Comparator.comparingDouble(CandidateScore::score)
+                        .thenComparingInt(candidate -> candidate.vm().getId()));
 
-            Vm vm =
-                    vmList.get(i);
+        final int count = Math.min(CANDIDATE_COUNT, scored.size());
+        final List<Vm> candidates = new ArrayList<>(count);
 
-            double workload =
-                    getVmRemainingWorkload(vm);
-
-            double normalizedWorkload =
-                    Math.min(
-                            1.0,
-                            workload
-                                    / maxWorkload);
-
-            double utilization =
-                    safeUtilization(vm);
-
-            /*
-             * DQN preference bonus.
-             */
-            double dqnBonus =
-                    i == preferredIndex
-                            ? 1.0
-                            : 0.0;
-
-            /*
-             * Incoming task workload.
-             */
-            double incomingLength =
-                    incomingCloudlet == null
-                            ? 0.0
-                            : incomingCloudlet.getLength();
-
-            double projectedWorkload =
-                    workload
-                            + incomingLength;
-
-            double normalizedProjected =
-                    Math.min(
-                            1.0,
-                            projectedWorkload
-                                    / MAX_REMAINING_WORKLOAD);
-
-            /*
-             * Final load-aware score.
-             *
-             * Lower is better.
-             */
-            double score =
-                    0.50
-                            * normalizedProjected
-                    + 0.35
-                            * utilization
-                    - 0.15
-                            * dqnBonus;
-
-            /*
-             * Penalize heavily loaded VMs.
-             */
-            if (workload > 5_000_000.0) {
-                score += 2.0;
-            }
-
-            /*
-             * Small preference for the VM
-             * selected by the DQN.
-             */
-            if (vm == preferredVm) {
-                score -= 0.05;
-            }
-
-            if (score < bestScore) {
-
-                bestScore =
-                        score;
-
-                bestVm =
-                        vm;
-            }
+        for (int i = 0; i < count; i++) {
+            candidates.add(scored.get(i).vm());
         }
 
-        /*
-         * Avoid unused variable warning.
-         */
-        if (preferredWorkload < 0) {
-            return preferredVm;
-        }
-
-        return bestVm;
+        return candidates;
     }
 
     private DqnState observeState(
@@ -264,116 +170,49 @@ public class AdvancedDqnBroker
             Cloudlet incomingCloudlet) {
 
         if (vmList.isEmpty()) {
-
-            return new DqnState(
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0);
+            return new DqnState(0, 0, 0, 0, 0, 0);
         }
 
-        double totalUtilization =
-                0.0;
-
-        double[] utilizations =
-                new double[vmList.size()];
-
-        double totalRemainingWorkload =
-                0.0;
+        double totalUtilization = 0.0;
+        double totalRemainingWorkload = 0.0;
+        double[] utilizations = new double[vmList.size()];
 
         int index = 0;
-
         for (Vm vm : vmList) {
-
-            double utilization =
-                    safeUtilization(vm);
-
-            utilizations[index++] =
-                    utilization;
-
-            totalUtilization +=
-                    utilization;
-
-            totalRemainingWorkload +=
-                    getVmRemainingWorkload(vm);
+            final double utilization = safeUtilization(vm);
+            utilizations[index++] = utilization;
+            totalUtilization += utilization;
+            totalRemainingWorkload += getVmRemainingWorkload(vm);
         }
 
-        double meanUtilization =
-                totalUtilization
-                        / vmList.size();
+        final double meanUtilization = totalUtilization / vmList.size();
 
-        double variance =
-                0.0;
-
-        for (double utilization :
-                utilizations) {
-
-            variance +=
-                    Math.pow(
-                            utilization
-                                    - meanUtilization,
-                            2);
+        double variance = 0.0;
+        for (double utilization : utilizations) {
+            variance += Math.pow(utilization - meanUtilization, 2);
         }
 
-        double stdDev =
-                Math.sqrt(
-                        variance
-                                / vmList.size());
+        final double stdDev = Math.sqrt(variance / vmList.size());
 
-        double waiting =
-                getCloudletWaitingList()
-                        .size();
+        final double queueLoad = clamp(
+                getCloudletWaitingList().size() / MAX_QUEUE_LENGTH);
 
-        double queueLoad =
-                Math.min(
-                        1.0,
-                        waiting / 200.0);
+        final double incomingLength = incomingCloudlet == null
+                ? 0.0
+                : Math.max(0.0, incomingCloudlet.getLength());
 
-        double incomingLength =
-                incomingCloudlet == null
-                        ? 0.0
-                        : incomingCloudlet.getLength();
+        final double remainingWorkload = totalRemainingWorkload + incomingLength;
+        final double normalizedRemainingWorkload = clamp(
+                remainingWorkload / MAX_SYSTEM_WORKLOAD);
 
-        double remainingWorkload =
-                totalRemainingWorkload
-                        + incomingLength;
+        final double currentPower =
+                POWER_IDLE + (POWER_MAX - POWER_IDLE) * meanUtilization;
+        final double normalizedEnergy = clamp(currentPower / POWER_MAX);
 
-        double normalizedRemainingWorkload =
-                Math.min(
-                        1.0,
-                        remainingWorkload
-                                / MAX_REMAINING_WORKLOAD);
-
-        double currentPower =
-                POWER_IDLE
-                        + (POWER_MAX - POWER_IDLE)
-                        * meanUtilization;
-
-        double normalizedEnergy =
-                Math.min(
-                        1.0,
-                        currentPower
-                                / POWER_MAX);
-
-        double cpuCost =
-                meanUtilization
-                        * COST_PER_CPU_SEC;
-
-        double ramCost =
-                COST_PER_RAM_MB_SEC
-                        * 1024.0;
-
-        double currentCostRate =
-                cpuCost
-                        + ramCost;
-
-        double normalizedCost =
-                Math.min(
-                        1.0,
-                        currentCostRate
-                                / 5.0);
+        final double currentCostRate =
+                meanUtilization * COST_PER_CPU_SEC
+                        + COST_PER_RAM_MB_SEC * 1024.0;
+        final double normalizedCost = clamp(currentCostRate / MAX_COST_RATE);
 
         return new DqnState(
                 meanUtilization,
@@ -384,139 +223,110 @@ public class AdvancedDqnBroker
                 normalizedCost);
     }
 
-    /*
-     * Actual scheduler-state workload.
-     *
-     * Executing:
-     * remaining length
-     *
-     * Waiting:
-     * complete length
+    /**
+     * Actual scheduler-state workload inspection.
+     * Executing cloudlets contribute their remaining length; waiting
+     * cloudlets contribute their full length.
      */
-    private double getVmRemainingWorkload(
-            Vm vm) {
-
+    private double getVmRemainingWorkload(Vm vm) {
         if (vm == null) {
             return 0.0;
         }
 
-        CloudletScheduler scheduler =
-                vm.getCloudletScheduler();
-
+        final CloudletScheduler scheduler = vm.getCloudletScheduler();
         if (scheduler == null) {
             return 0.0;
         }
 
-        double workload =
-                0.0;
+        double workload = 0.0;
 
-        /*
-         * Executing Cloudlets.
-         */
-        for (CloudletExecution execution :
-                scheduler.getCloudletExecList()) {
-
+        for (CloudletExecution execution : scheduler.getCloudletExecList()) {
             if (execution == null) {
                 continue;
             }
 
-            double remaining =
-                    execution
-                            .getRemainingCloudletLength();
-
+            final double remaining = execution.getRemainingCloudletLength();
             if (remaining > 0.0) {
-                workload +=
-                        remaining;
+                workload += remaining;
             }
         }
 
-        /*
-         * Waiting Cloudlets.
-         */
-        for (CloudletExecution execution :
-                scheduler.getCloudletWaitingList()) {
-
+        for (CloudletExecution execution : scheduler.getCloudletWaitingList()) {
             if (execution == null) {
                 continue;
             }
 
-            workload +=
-                    execution.getCloudletLength();
+            workload += Math.max(0.0, execution.getCloudletLength());
         }
 
         return workload;
     }
 
-    private double safeUtilization(
-            Vm vm) {
-
+    private double safeUtilization(Vm vm) {
         if (vm == null) {
             return 0.0;
         }
 
-        double utilization;
-
         try {
-
-            utilization =
-                    vm.getCpuPercentUtilization();
-
-        } catch (Exception e) {
-
-            utilization = 0.0;
-        }
-
-        if (Double.isNaN(utilization)
-                || Double.isInfinite(utilization)) {
-
+            final double utilization = vm.getCpuPercentUtilization();
+            return clamp(utilization);
+        } catch (Exception ignored) {
             return 0.0;
         }
-
-        return Math.max(
-                0.0,
-                Math.min(
-                        1.0,
-                        utilization));
     }
 
+    /**
+     * Adaptive multi-objective reward inspired by RL-MOTS:
+     * under heavy queues, QoS receives more weight; at lighter loads,
+     * energy and cost receive relatively higher weight.
+     */
     private double calculateReward(
             DqnState previous,
             DqnState current) {
 
-        double previousQoS =
-                previous.getFeature(2)
-                        + previous.getFeature(3);
+        final double previousQos =
+                previous.getFeature(2) + previous.getFeature(3);
+        final double currentQos =
+                current.getFeature(2) + current.getFeature(3);
 
-        double currentQoS =
-                current.getFeature(2)
-                        + current.getFeature(3);
+        final double qosImprovement = previousQos - currentQos;
+        final double energyImprovement =
+                previous.getFeature(4) - current.getFeature(4);
+        final double costImprovement =
+                previous.getFeature(5) - current.getFeature(5);
+        final double balanceImprovement =
+                previous.getFeature(1) - current.getFeature(1);
+        final double utilizationImprovement =
+                current.getFeature(0) - previous.getFeature(0);
 
-        double qosImprovement =
-                previousQoS
-                        - currentQoS;
+        final double queuePressure = current.getFeature(2);
 
-        double energyImprovement =
-                previous.getFeature(4)
-                        - current.getFeature(4);
-
-        double costImprovement =
-                previous.getFeature(5)
-                        - current.getFeature(5);
-
-        double imbalanceImprovement =
-                previous.getFeature(1)
-                        - current.getFeature(1);
+        final double qosWeight = 0.30 + 0.30 * queuePressure;
+        final double energyWeight = 0.40 - 0.15 * queuePressure;
+        final double costWeight = 1.0 - qosWeight - energyWeight;
 
         double reward =
-                0.40
-                        * qosImprovement
-                + 0.25
-                        * energyImprovement
-                + 0.20
-                        * costImprovement
-                + 0.15
-                        * imbalanceImprovement;
+                qosWeight * qosImprovement
+                        + energyWeight * energyImprovement
+                        + costWeight * costImprovement
+                        + 0.15 * balanceImprovement
+                        + 0.05 * utilizationImprovement;
 
-        return reward;
+        /* Keep rare numerical spikes from destabilizing the lightweight NN. */
+        if (Double.isNaN(reward) || Double.isInfinite(reward)) {
+            return 0.0;
+        }
+
+        return Math.max(-1.0, Math.min(1.0, reward));
+    }
+
+    private double clamp(double value) {
+        if (Double.isNaN(value) || Double.isInfinite(value)) {
+            return 0.0;
+        }
+        return Math.max(0.0, Math.min(1.0, value));
+    }
+
+    private record CandidateScore(Vm vm, double score) {
     }
 }
