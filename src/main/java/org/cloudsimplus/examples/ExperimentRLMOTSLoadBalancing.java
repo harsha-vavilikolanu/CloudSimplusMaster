@@ -15,394 +15,857 @@ import org.cloudsimplus.utilizationmodels.UtilizationModelDynamic;
 import org.cloudsimplus.vms.Vm;
 import org.cloudsimplus.vms.VmSimple;
 
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 
+/**
+ * Cloud Load Balancing using Reinforcement Learning.
+ *
+ * TEST CONFIGURATION
+ * ------------------
+ * Hosts       : 20
+ * VMs         : 100
+ * Cloudlets   : 1000
+ * Runs        : 1
+ *
+ * Algorithms:
+ *   FCFS
+ *   Round Robin
+ *   Max-Min
+ *   Proposed DQN
+ *
+ * Metrics:
+ *   Makespan
+ *   Throughput
+ *   ARUR
+ *   Degree of Imbalance
+ *   Energy
+ *   Cost
+ *
+ * Once this configuration completes successfully,
+ * restore the final 200/400/600/800/1000 x 25-run benchmark.
+ */
 public class ExperimentRLMOTSLoadBalancing {
 
-    private static final int NUM_HOSTS =
-            20;
+    /* =========================================================
+       EXPERIMENT SIZE
+       ========================================================= */
 
-    private static final int NUM_VMS =
-            100;
+    private static final int NUM_HOSTS = 10;
 
+    private static final int NUM_VMS = 20;
+
+    /*
+     * Temporary validation run.
+     *
+     * Final paper benchmark:
+     * 200, 400, 600, 800, 1000
+     */
     private static final int[] TASK_SCENARIOS = {
-            200,
-            400,
-            600,
-            800,
-            1000
+    		1000
     };
 
-    private static final long RANDOM_SEED =
-            42L;
+    private static final int DEFAULT_RUNS = 1;
 
-    private static final double POWER_IDLE =
-            175.0;
+    private static final long BASE_SEED = 42_000L;
 
-    private static final double POWER_MAX =
-            375.0;
+    /* =========================================================
+       POWER MODEL
+       ========================================================= */
 
-    private static final double COST_PER_CPU_SEC =
-            0.03;
+    private static final double POWER_IDLE = 175.0;
 
-    private static final double COST_PER_RAM_MB_SEC =
-            0.0005;
+    private static final double POWER_MAX = 375.0;
 
-    public static void main(
-            String[] args) {
+    /* =========================================================
+       COST MODEL
+       ========================================================= */
+
+    private static final double COST_PER_CPU_SEC = 0.03;
+
+    private static final double COST_PER_RAM_MB_SEC = 0.0005;
+
+    /* =========================================================
+       MAIN
+       ========================================================= */
+
+    public static void main(String[] args)
+            throws IOException {
+
+        final int runs = parseRuns(args);
+
+        System.out.println();
+        System.out.println(
+                "=============================================================="
+        );
+        System.out.println(
+                " CLOUD LOAD BALANCING USING REINFORCEMENT LEARNING"
+        );
+        System.out.println(
+                "=============================================================="
+        );
 
         System.out.println(
-                "==========================================================================");
+                "CloudSim Plus 8.5.7"
+        );
 
         System.out.println(
-                " DYNAMIC CLOUD LOAD BALANCING & MULTI-OBJECTIVE TASK SCHEDULING");
+                "Hosts       : " + NUM_HOSTS
+        );
 
         System.out.println(
-                " CloudSim Plus 8.5.7 - Double-DQN Experimental Testbed");
+                "VMs         : " + NUM_VMS
+        );
 
         System.out.println(
-                " Algorithms: FCFS | Round Robin | Max-Min | Proposed Double-DQN");
+                "Tasks       : " +
+                        formatTaskScenarios()
+        );
 
         System.out.println(
-                "==========================================================================");
+                "Runs        : " + runs
+        );
 
-        for (int taskCount :
-                TASK_SCENARIOS) {
+        System.out.println(
+                "Algorithms  : FCFS | Round Robin | Max-Min | Proposed DQN"
+        );
 
-            System.out.println();
+        System.out.println(
+                "=============================================================="
+        );
 
-            System.out.println(
-                    "--------------------------------------------------------------------------");
+        final Map<String, MetricAccumulator> aggregate =
+                new LinkedHashMap<>();
 
-            System.out.printf(
-                    "WORKLOAD SCENARIO: %d CLOUDLETS%n",
-                    taskCount);
+        final Path resultsDir =
+                Paths.get("results");
 
-            System.out.println(
-                    "--------------------------------------------------------------------------");
+        Files.createDirectories(
+                resultsDir
+        );
 
-            printHeader();
+        final Path csvPath =
+                resultsDir.resolve(
+                        "rlmots_results.csv"
+                );
 
-            runSimulationForScenario(
-                    "FCFS",
-                    taskCount);
+        try (BufferedWriter writer =
+                     Files.newBufferedWriter(csvPath)) {
 
-            runSimulationForScenario(
-                    "RoundRobin",
-                    taskCount);
+            writer.write(
+                    "tasks,run,algorithm,makespan_s," +
+                    "throughput,arur,degree_of_imbalance," +
+                    "energy_kj,cost"
+            );
 
-            runSimulationForScenario(
-                    "MaxMin",
-                    taskCount);
+            writer.newLine();
 
-            runSimulationForScenario(
-                    "Proposed_DQN",
-                    taskCount);
+            for (int taskCount :
+                    TASK_SCENARIOS) {
+
+                System.out.println();
+                System.out.println(
+                        "--------------------------------------------------------------"
+                );
+                System.out.println(
+                        "WORKLOAD SCENARIO: "
+                                + taskCount
+                                + " CLOUDLETS"
+                );
+                System.out.println(
+                        "--------------------------------------------------------------"
+                );
+
+                for (int run = 1;
+                     run <= runs;
+                     run++) {
+
+                    final long workloadSeed =
+                            BASE_SEED
+                                    + (long) taskCount
+                                    * 10_000L
+                                    + run;
+
+                    System.out.println(
+                            "Run " +
+                                    run +
+                                    "/" +
+                                    runs
+                    );
+
+                    final String[] algorithms = {
+                            "FCFS",
+                            "RoundRobin",
+                            "MaxMin",
+                            "Proposed_DQN"
+                    };
+
+                    for (String algorithm :
+                            algorithms) {
+
+                        System.out.println(
+                                "  Starting " +
+                                        algorithm +
+                                        "..."
+                        );
+
+                        final long agentSeed =
+                                workloadSeed
+                                        + 900_000L;
+
+                        final long wallStart =
+                                System.currentTimeMillis();
+
+                        final Result result =
+                                runSimulationForScenario(
+                                        algorithm,
+                                        taskCount,
+                                        workloadSeed,
+                                        agentSeed
+                                );
+
+                        final long wallTime =
+                                System.currentTimeMillis()
+                                        - wallStart;
+
+                        if (!result.valid()) {
+
+                            System.out.printf(
+                                    "  %-14s INVALID (%d/%d) " +
+                                    "[%d ms]%n",
+
+                                    algorithm,
+                                    result.finishedCount(),
+                                    taskCount,
+                                    wallTime
+                            );
+
+                            continue;
+                        }
+
+                        System.out.printf(
+                                "  %-14s " +
+                                "makespan=%8.4f s " +
+                                "throughput=%10.4f " +
+                                "ARUR=%8.4f " +
+                                "DI=%8.4f " +
+                                "energy=%10.4f kJ " +
+                                "cost=%10.6f " +
+                                "[%d ms]%n",
+
+                                algorithm,
+                                result.makespan(),
+                                result.throughput(),
+                                result.averageUtilization(),
+                                result.degreeOfImbalance(),
+                                result.energy(),
+                                result.cost(),
+                                wallTime
+                        );
+
+                        writer.write(
+                                String.format(
+                                        "%d,%d,%s,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f",
+                                        taskCount,
+                                        run,
+                                        algorithm,
+                                        result.makespan(),
+                                        result.throughput(),
+                                        result.averageUtilization(),
+                                        result.degreeOfImbalance(),
+                                        result.energy(),
+                                        result.cost()
+                                )
+                        );
+
+                        writer.newLine();
+                        writer.flush();
+
+                        final String key =
+                                taskCount +
+                                        "-" +
+                                        algorithm;
+
+                        aggregate
+                                .computeIfAbsent(
+                                        key,
+                                        ignored ->
+                                                new MetricAccumulator()
+                                )
+                                .add(result);
+                    }
+                }
+            }
         }
 
+        printSummary(
+                aggregate
+        );
+
         System.out.println();
+        System.out.println(
+                "Raw results saved to:"
+        );
 
         System.out.println(
-                "==========================================================================");
+                csvPath.toAbsolutePath()
+        );
 
+        System.out.println();
         System.out.println(
-                " ALL SIMULATION EXPERIMENTS COMPLETED");
-
+                "=============================================================="
+        );
         System.out.println(
-                "==========================================================================");
+                " EXPERIMENT FINISHED"
+        );
+        System.out.println(
+                "=============================================================="
+        );
     }
 
-    private static void printHeader() {
+    /* =========================================================
+       FORMAT TASK SCENARIOS
+       ========================================================= */
 
-        System.out.printf(
-                "%-15s | %-14s | %-14s | %-8s | %-8s | %-14s | %-12s%n",
-                "Algorithm",
-                "Makespan(s)",
-                "Throughput",
-                "ARUR",
-                "DI",
-                "Energy(kJ)",
-                "Cost($)");
+    private static String formatTaskScenarios() {
 
-        System.out.println(
-                "--------------------------------------------------------------------------");
+        StringBuilder builder =
+                new StringBuilder();
+
+        for (int i = 0;
+             i < TASK_SCENARIOS.length;
+             i++) {
+
+            if (i > 0) {
+                builder.append(", ");
+            }
+
+            builder.append(
+                    TASK_SCENARIOS[i]
+            );
+        }
+
+        return builder.toString();
     }
 
-    private static void runSimulationForScenario(
+    /* =========================================================
+       RUN COUNT
+       ========================================================= */
+
+    private static int parseRuns(
+            String[] args) {
+
+        if (args.length == 0) {
+            return DEFAULT_RUNS;
+        }
+
+        try {
+
+            final int runs =
+                    Integer.parseInt(
+                            args[0].trim()
+                    );
+
+            if (runs <= 0) {
+                throw new NumberFormatException();
+            }
+
+            return runs;
+
+        } catch (NumberFormatException ex) {
+
+            throw new IllegalArgumentException(
+                    "First argument must be a positive integer.",
+                    ex
+            );
+        }
+    }
+
+    /* =========================================================
+       RUN ONE SIMULATION
+       ========================================================= */
+
+    private static Result
+    runSimulationForScenario(
             String algorithm,
-            int numTasks) {
-
-        System.out.println();
-
-        System.out.println(
-                "Running "
-                        + algorithm
-                        + " with "
-                        + numTasks
-                        + " Cloudlets...");
+            int numTasks,
+            long workloadSeed,
+            long agentSeed) {
 
         /*
-         * ============================================================
-         * CREATE SIMULATION
-         * ============================================================
+         * Completely independent simulation.
          */
-
-        CloudSimPlus simulation =
+        final CloudSimPlus simulation =
                 new CloudSimPlus();
 
-        /*
-         * ============================================================
-         * CREATE DATACENTER
-         * ============================================================
-         */
-
         createDatacenter(
-                simulation);
+                simulation
+        );
 
-        /*
-         * ============================================================
-         * CREATE BROKER
-         * ============================================================
-         */
+        final DatacenterBroker broker;
 
-        DatacenterBroker broker;
+        /* =====================================================
+           DQN
+           ===================================================== */
 
         if ("Proposed_DQN"
                 .equalsIgnoreCase(algorithm)) {
 
-            DqnAgent agent =
+            final DqnAgent agent =
                     new DqnAgent(
                             DqnState.STATE_DIM,
-                            NUM_VMS,
-                            RANDOM_SEED
-                                    + numTasks);
+                            AdvancedDqnBroker.CANDIDATE_COUNT,
+                            agentSeed
+                    );
 
             broker =
                     new AdvancedDqnBroker(
                             simulation,
                             "DqnBroker",
-                            agent);
+                            agent
+                    );
 
-        } else if ("RoundRobin"
+        }
+
+        /* =====================================================
+           ROUND ROBIN
+           ===================================================== */
+
+        else if ("RoundRobin"
                 .equalsIgnoreCase(algorithm)) {
 
             broker =
                     new BaselineBrokers.RoundRobinBroker(
                             simulation,
-                            "RoundRobinBroker");
+                            "RoundRobinBroker"
+                    );
+        }
 
-        } else if ("MaxMin"
+        /* =====================================================
+           MAX-MIN
+           ===================================================== */
+
+        else if ("MaxMin"
                 .equalsIgnoreCase(algorithm)) {
 
             broker =
                     new BaselineBrokers.MaxMinBroker(
                             simulation,
-                            "MaxMinBroker");
+                            "MaxMinBroker"
+                    );
+        }
 
-        } else {
+        /* =====================================================
+           FCFS
+           ===================================================== */
+
+        else {
 
             broker =
                     new BaselineBrokers.FcfsBroker(
                             simulation,
-                            "FcfsBroker");
+                            "FcfsBroker"
+                    );
         }
 
         /*
-         * ============================================================
-         * IMPORTANT BROKER LIFECYCLE SETTINGS
-         * ============================================================
+         * Keep broker alive.
          */
-
-        broker.setShutdownWhenIdle(false);
-
-        broker.setVmDestructionDelay(-1);
+        broker.setShutdownWhenIdle(
+                false
+        );
 
         /*
-         * ============================================================
-         * CREATE VMS
-         * ============================================================
+         * Disable automatic VM destruction.
          */
+        broker.setVmDestructionDelay(
+                -1
+        );
 
-        List<Vm> vmList =
+        /*
+         * Create VMs.
+         */
+        final List<Vm> vmList =
                 createHeterogeneousVms();
 
         /*
-         * ============================================================
-         * CREATE CLOUDLETS
-         * ============================================================
+         * Create Cloudlets.
          */
-
-        List<Cloudlet> cloudletList =
+        final List<Cloudlet> cloudletList =
                 createDynamicCloudlets(
-                        numTasks);
+                        numTasks,
+                        workloadSeed
+                );
 
         /*
-         * ============================================================
-         * ENABLE UTILIZATION STATISTICS
-         * ============================================================
+         * Enable statistics.
          */
-
-        for (Vm vm : vmList) {
+        for (Vm vm :
+                vmList) {
 
             vm.enableUtilizationStats();
         }
 
         /*
-         * ============================================================
-         * SUBMIT VMS
-         * ============================================================
+         * Submit VMs.
          */
-
         broker.submitVmList(
-                vmList);
+                vmList
+        );
 
         /*
-         * ============================================================
-         * SUBMIT CLOUDLETS
-         * ============================================================
+         * Submit Cloudlets.
          */
-
         broker.submitCloudletList(
-                cloudletList);
+                cloudletList
+        );
 
         /*
-         * ============================================================
-         * START SIMULATION
-         * ============================================================
+         * Start simulation.
          */
-
         simulation.start();
 
         /*
-         * ============================================================
-         * GET FINISHED CLOUDLETS
-         * ============================================================
+         * Collect completed Cloudlets.
          */
-
-        List<Cloudlet> finishedCloudlets =
+        final List<Cloudlet>
+                finishedCloudlets =
                 broker.getCloudletFinishedList();
 
-        int finishedCount =
+        final int finishedCount =
                 finishedCloudlets.size();
 
         /*
-         * ============================================================
-         * STRICT VALIDATION
-         * ============================================================
+         * Do not use partial results.
          */
-
         if (finishedCount != numTasks) {
 
-            System.out.println();
-
-            System.out.println(
-                    "==========================================================================");
-
-            System.out.println(
-                    "INVALID EXPERIMENT RESULT");
-
-            System.out.println(
-                    algorithm
-                            + " completed "
-                            + finishedCount
-                            + " / "
-                            + numTasks
-                            + " Cloudlets.");
-
-            System.out.println(
-                    "Result discarded because not all Cloudlets completed.");
-
-            System.out.println(
-                    "==========================================================================");
-
-            return;
+            return Result.invalid(
+                    finishedCount
+            );
         }
 
-        System.out.println(
-                "SUCCESS: "
-                        + algorithm
-                        + " completed all "
-                        + numTasks
-                        + " Cloudlets.");
-
         /*
-         * ============================================================
-         * MAKESPAN
-         * ============================================================
+         * Metrics.
          */
-
-        double makespan =
+        final double makespan =
                 calculateMakespan(
-                        finishedCloudlets);
+                        finishedCloudlets
+                );
 
-        /*
-         * ============================================================
-         * THROUGHPUT
-         * ============================================================
-         */
-
-        double throughput =
+        final double throughput =
                 makespan > 0.0
-                        ? finishedCount
-                                / makespan
+                        ? finishedCount / makespan
                         : 0.0;
 
-        /*
-         * ============================================================
-         * UTILIZATION
-         * ============================================================
-         */
-
-        UtilizationMetrics metrics =
+        final UtilizationMetrics
+                utilization =
                 calculateUtilizationMetrics(
-                        vmList);
+                        vmList
+                );
 
-        /*
-         * ============================================================
-         * ENERGY
-         * ============================================================
-         */
-
-        double energy =
+        final double energy =
                 calculateEnergy(
-                        metrics.averageUtilization,
-                        makespan);
+                        utilization.averageUtilization(),
+                        makespan
+                );
 
-        /*
-         * ============================================================
-         * COST
-         * ============================================================
-         */
-
-        double cost =
+        final double cost =
                 calculateCost(
-                        metrics.averageUtilization,
-                        makespan);
+                        utilization.averageUtilization(),
+                        makespan
+                );
 
-        /*
-         * ============================================================
-         * RESULT
-         * ============================================================
-         */
-
-        System.out.printf(
-                "%-15s | %-14.3f | %-14.6f | %-8.4f | %-8.4f | %-14.3f | %-12.3f%n",
-                algorithm,
+        return new Result(
+                true,
+                finishedCount,
                 makespan,
                 throughput,
-                metrics.averageUtilization,
-                metrics.degreeOfImbalance,
+                utilization.averageUtilization(),
+                utilization.degreeOfImbalance(),
                 energy,
-                cost);
+                cost
+        );
     }
 
-    private static double calculateMakespan(
+    /* =========================================================
+       DATACENTER
+       ========================================================= */
+
+    private static Datacenter
+    createDatacenter(
+            CloudSimPlus simulation) {
+
+        final List<Host> hostList =
+                new ArrayList<>();
+
+        for (int hostId = 0;
+             hostId < NUM_HOSTS;
+             hostId++) {
+
+            /*
+             * 8 PEs per host.
+             */
+            final int numberOfPes =
+                    8;
+
+            /*
+             * 10,000 MIPS per PE.
+             */
+            final long mipsPerPe =
+                    10_000L;
+
+            final List<Pe> peList =
+                    new ArrayList<>(
+                            numberOfPes
+                    );
+
+            for (int peId = 0;
+                 peId < numberOfPes;
+                 peId++) {
+
+                peList.add(
+                        new PeSimple(
+                                mipsPerPe
+                        )
+                );
+            }
+
+            /*
+             * Host resources.
+             */
+            final long hostRam =
+                    64L * 1024L;
+
+            final long hostBw =
+                    1_000_000L;
+
+            final long hostStorage =
+                    1_000_000L;
+
+            final Host host =
+                    new HostSimple(
+                            hostRam,
+                            hostBw,
+                            hostStorage,
+                            peList
+                    );
+
+            hostList.add(
+                    host
+            );
+        }
+
+        final Datacenter datacenter =
+                new DatacenterSimple(
+                        simulation,
+                        hostList,
+                        new VmAllocationPolicySimple()
+                );
+
+        /*
+         * Keep scheduling interval reasonably small.
+         */
+        datacenter.setSchedulingInterval(
+                1.0
+        );
+
+        return datacenter;
+    }
+
+    /* =========================================================
+       VMS
+       ========================================================= */
+
+    private static List<Vm>
+    createHeterogeneousVms() {
+
+        final List<Vm> vmList =
+                new ArrayList<>(
+                        NUM_VMS
+                );
+
+        for (int vmId = 0;
+             vmId < NUM_VMS;
+             vmId++) {
+
+            final int tier =
+                    vmId % 4;
+
+            final long mips;
+            final int pes;
+
+            switch (tier) {
+
+                case 0 -> {
+                    /*
+                     * High tier.
+                     */
+                    mips = 5_000L;
+                    pes = 2;
+                }
+
+                case 1 -> {
+                    /*
+                     * Medium-high tier.
+                     */
+                    mips = 4_000L;
+                    pes = 1;
+                }
+
+                case 2 -> {
+                    /*
+                     * Medium tier.
+                     */
+                    mips = 3_000L;
+                    pes = 1;
+                }
+
+                default -> {
+                    /*
+                     * Low tier.
+                     */
+                    mips = 2_000L;
+                    pes = 1;
+                }
+            }
+
+            final Vm vm =
+                    new VmSimple(
+                            vmId,
+                            mips,
+                            pes
+                    );
+
+            /*
+             * 8 GB RAM.
+             */
+            vm.setRam(
+                    8L * 1024L
+            );
+
+            /*
+             * 50,000 Mbps bandwidth.
+             */
+            vm.setBw(
+                    50_000L
+            );
+
+            vm.setSize(
+                    10_000L
+            );
+
+            vmList.add(
+                    vm
+            );
+        }
+
+        return vmList;
+    }
+
+    /* =========================================================
+       CLOUDLETS
+       ========================================================= */
+
+    private static List<Cloudlet>
+    createDynamicCloudlets(
+            int numTasks,
+            long seed) {
+
+        final List<Cloudlet>
+                cloudletList =
+                new ArrayList<>(
+                        numTasks
+                );
+
+        final Random random =
+                new Random(seed);
+
+        /*
+         * CPU utilization.
+         */
+        final UtilizationModelDynamic
+                cpuUtilization =
+                new UtilizationModelDynamic(
+                        0.8
+                );
+
+        /*
+         * RAM utilization = 0%.
+         */
+        final UtilizationModelDynamic
+                ramUtilization =
+                new UtilizationModelDynamic(
+                        0.0
+                );
+
+        /*
+         * BW utilization = 0%.
+         */
+        final UtilizationModelDynamic
+                bwUtilization =
+                new UtilizationModelDynamic(
+                        0.0
+                );
+
+        for (int i = 0;
+             i < numTasks;
+             i++) {
+
+            /*
+             * 1,000 - 5,000 MI.
+             */
+            final long length =
+                    1_000L
+                            + (long) (
+                                    random.nextDouble()
+                                            * 4_001L
+                            );
+
+            final Cloudlet cloudlet =
+                    new CloudletSimple(
+                            i,
+                            length,
+                            1
+                    );
+
+            cloudlet.setUtilizationModelCpu(
+                    cpuUtilization
+            );
+
+            cloudlet.setUtilizationModelRam(
+                    ramUtilization
+            );
+
+            cloudlet.setUtilizationModelBw(
+                    bwUtilization
+            );
+
+            cloudletList.add(
+                    cloudlet
+            );
+        }
+
+        return cloudletList;
+    }
+
+    /* =========================================================
+       MAKESPAN
+       ========================================================= */
+
+    private static double
+    calculateMakespan(
             List<Cloudlet> cloudlets) {
 
-        double makespan =
-                0.0;
+        double makespan = 0.0;
 
         for (Cloudlet cloudlet :
                 cloudlets) {
@@ -410,11 +873,16 @@ public class ExperimentRLMOTSLoadBalancing {
             makespan =
                     Math.max(
                             makespan,
-                            cloudlet.getFinishTime());
+                            cloudlet.getFinishTime()
+                    );
         }
 
         return makespan;
     }
+
+    /* =========================================================
+       ARUR / DI
+       ========================================================= */
 
     private static UtilizationMetrics
     calculateUtilizationMetrics(
@@ -429,8 +897,7 @@ public class ExperimentRLMOTSLoadBalancing {
         double minUtilization =
                 1.0;
 
-        int count =
-                0;
+        int count = 0;
 
         for (Vm vm :
                 vmList) {
@@ -443,16 +910,20 @@ public class ExperimentRLMOTSLoadBalancing {
                         vm.getCpuUtilizationStats()
                                 .getMean();
 
-            } catch (Exception e) {
+            } catch (Exception ignored) {
 
                 utilization =
                         vm.getCpuPercentUtilization();
             }
 
-            if (Double.isNaN(utilization)
-                    || Double.isInfinite(utilization)) {
+            if (Double.isNaN(
+                    utilization)
+                    ||
+                    Double.isInfinite(
+                            utilization)) {
 
-                utilization = 0.0;
+                utilization =
+                        0.0;
             }
 
             utilization =
@@ -460,7 +931,9 @@ public class ExperimentRLMOTSLoadBalancing {
                             0.0,
                             Math.min(
                                     1.0,
-                                    utilization));
+                                    utilization
+                            )
+                    );
 
             totalUtilization +=
                     utilization;
@@ -468,12 +941,14 @@ public class ExperimentRLMOTSLoadBalancing {
             maxUtilization =
                     Math.max(
                             maxUtilization,
-                            utilization);
+                            utilization
+                    );
 
             minUtilization =
                     Math.min(
                             minUtilization,
-                            utilization);
+                            utilization
+                    );
 
             count++;
         }
@@ -482,26 +957,39 @@ public class ExperimentRLMOTSLoadBalancing {
 
             return new UtilizationMetrics(
                     0.0,
-                    0.0);
+                    0.0
+            );
         }
 
-        double averageUtilization =
+        final double averageUtilization =
                 totalUtilization
                         / count;
 
-        double degreeOfImbalance =
+        final double degreeOfImbalance =
                 averageUtilization > 0.0
-                        ? (maxUtilization
-                                - minUtilization)
+                        ?
+                        (
+                                (
+                                        maxUtilization
+                                                - minUtilization
+                                )
                                 / averageUtilization
-                        : 0.0;
+                        )
+                        :
+                        0.0;
 
         return new UtilizationMetrics(
                 averageUtilization,
-                degreeOfImbalance);
+                degreeOfImbalance
+        );
     }
 
-    private static double calculateEnergy(
+    /* =========================================================
+       ENERGY
+       ========================================================= */
+
+    private static double
+    calculateEnergy(
             double arur,
             double makespan) {
 
@@ -509,18 +997,25 @@ public class ExperimentRLMOTSLoadBalancing {
             return 0.0;
         }
 
-        double averagePower =
+        final double averagePower =
                 POWER_IDLE
-                        + (POWER_MAX
-                                - POWER_IDLE)
-                                * arur;
+                        +
+                        (
+                                POWER_MAX
+                                        - POWER_IDLE
+                        ) * arur;
 
         return averagePower
                 * makespan
                 / 1000.0;
     }
 
-    private static double calculateCost(
+    /* =========================================================
+       COST
+       ========================================================= */
+
+    private static double
+    calculateCost(
             double arur,
             double makespan) {
 
@@ -528,253 +1023,244 @@ public class ExperimentRLMOTSLoadBalancing {
             return 0.0;
         }
 
-        double cpuCostRate =
+        final double cpuCostRate =
                 arur
                         * COST_PER_CPU_SEC;
 
-        double ramCostRate =
+        final double ramCostRate =
                 COST_PER_RAM_MB_SEC
-                        * 1024.0;
+                        * 8192.0;
 
-        return (cpuCostRate
-                + ramCostRate)
+        return (
+                cpuCostRate
+                        + ramCostRate
+        )
                 * makespan
                 * NUM_VMS;
     }
 
-    /*
-     * ============================================================
-     * CREATE DATACENTER
-     * ============================================================
-     */
+    /* =========================================================
+       SUMMARY
+       ========================================================= */
 
-    private static Datacenter createDatacenter(
-            CloudSimPlus simulation) {
+    private static void
+    printSummary(
+            Map<String, MetricAccumulator>
+                    aggregate) {
 
-        List<Host> hostList =
+        System.out.println();
+        System.out.println(
+                "=============================================================="
+        );
+
+        System.out.println(
+                "RESULTS"
+        );
+
+        System.out.println(
+                "=============================================================="
+        );
+
+        System.out.printf(
+                "%-8s | %-14s | %12s | %12s | " +
+                "%10s | %10s | %12s | %10s%n",
+
+                "Tasks",
+                "Algorithm",
+                "Makespan",
+                "Throughput",
+                "ARUR",
+                "DI",
+                "Energy(kJ)",
+                "Cost"
+        );
+
+        System.out.println(
+                "--------------------------------------------------------------------------"
+        );
+
+        for (Map.Entry<String,
+                MetricAccumulator> entry :
+                aggregate.entrySet()) {
+
+            final String[] parts =
+                    entry.getKey()
+                            .split(
+                                    "-",
+                                    2
+                            );
+
+            final int tasks =
+                    Integer.parseInt(
+                            parts[0]
+                    );
+
+            final MetricAccumulator
+                    accumulator =
+                    entry.getValue();
+
+            System.out.printf(
+                    "%-8d | %-14s | " +
+                    "%12.4f | " +
+                    "%12.4f | " +
+                    "%10.4f | " +
+                    "%10.4f | " +
+                    "%12.4f | " +
+                    "%10.6f%n",
+
+                    tasks,
+                    parts[1],
+                    accumulator.meanMakespan(),
+                    accumulator.meanThroughput(),
+                    accumulator.meanArur(),
+                    accumulator.meanDi(),
+                    accumulator.meanEnergy(),
+                    accumulator.meanCost()
+            );
+        }
+
+        System.out.println(
+                "=============================================================="
+        );
+    }
+
+    /* =========================================================
+       RESULT
+       ========================================================= */
+
+    private record Result(
+            boolean valid,
+            int finishedCount,
+            double makespan,
+            double throughput,
+            double averageUtilization,
+            double degreeOfImbalance,
+            double energy,
+            double cost) {
+
+        static Result invalid(
+                int finishedCount) {
+
+            return new Result(
+                    false,
+                    finishedCount,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0
+            );
+        }
+    }
+
+    /* =========================================================
+       UTILIZATION
+       ========================================================= */
+
+    private record UtilizationMetrics(
+            double averageUtilization,
+            double degreeOfImbalance) {
+    }
+
+    /* =========================================================
+       ACCUMULATOR
+       ========================================================= */
+
+    private static class MetricAccumulator {
+
+        private final List<Double>
+                makespans =
                 new ArrayList<>();
 
-        for (int hostId = 0;
-             hostId < NUM_HOSTS;
-             hostId++) {
+        private final List<Double>
+                throughputs =
+                new ArrayList<>();
 
-            List<Pe> peList =
-                    new ArrayList<>();
+        private final List<Double>
+                arurs =
+                new ArrayList<>();
 
-            int numberOfPes =
-                    8;
+        private final List<Double>
+                dis =
+                new ArrayList<>();
 
-            long mipsPerPe =
-                    25_000L;
+        private final List<Double>
+                energies =
+                new ArrayList<>();
 
-            for (int peId = 0;
-                 peId < numberOfPes;
-                 peId++) {
+        private final List<Double>
+                costs =
+                new ArrayList<>();
 
-                peList.add(
-                        new PeSimple(
-                                mipsPerPe));
+        void add(Result result) {
+
+            makespans.add(
+                    result.makespan()
+            );
+
+            throughputs.add(
+                    result.throughput()
+            );
+
+            arurs.add(
+                    result.averageUtilization()
+            );
+
+            dis.add(
+                    result.degreeOfImbalance()
+            );
+
+            energies.add(
+                    result.energy()
+            );
+
+            costs.add(
+                    result.cost()
+            );
+        }
+
+        double meanMakespan() {
+            return mean(makespans);
+        }
+
+        double meanThroughput() {
+            return mean(throughputs);
+        }
+
+        double meanArur() {
+            return mean(arurs);
+        }
+
+        double meanDi() {
+            return mean(dis);
+        }
+
+        double meanEnergy() {
+            return mean(energies);
+        }
+
+        double meanCost() {
+            return mean(costs);
+        }
+
+        private static double mean(
+                List<Double> values) {
+
+            if (values.isEmpty()) {
+                return 0.0;
             }
 
-            long hostRam =
-                    512L * 1024L;
+            double sum = 0.0;
 
-            long hostBw =
-                    1_000_000L;
+            for (double value :
+                    values) {
 
-            long hostStorage =
-                    4_000_000L;
-
-            Host host =
-                    new HostSimple(
-                            hostRam,
-                            hostBw,
-                            hostStorage,
-                            peList);
-
-            hostList.add(host);
-        }
-
-        Datacenter datacenter =
-                new DatacenterSimple(
-                        simulation,
-                        hostList,
-                        new VmAllocationPolicySimple());
-
-        /*
-         * IMPORTANT:
-         * Schedule VM/Cloudlet processing
-         * every 0.1 second.
-         */
-        datacenter.setSchedulingInterval(
-                0.1);
-
-        return datacenter;
-    }
-
-    /*
-     * ============================================================
-     * CREATE HETEROGENEOUS VMS
-     * ============================================================
-     */
-
-    private static List<Vm>
-    createHeterogeneousVms() {
-
-        List<Vm> vmList =
-                new ArrayList<>(
-                        NUM_VMS);
-
-        for (int vmId = 0;
-             vmId < NUM_VMS;
-             vmId++) {
-
-            int tier =
-                    vmId % 4;
-
-            long mips;
-            int pes;
-
-            switch (tier) {
-
-                case 0:
-                    mips = 10_000L;
-                    pes = 2;
-                    break;
-
-                case 1:
-                    mips = 7_500L;
-                    pes = 1;
-                    break;
-
-                case 2:
-                    mips = 5_000L;
-                    pes = 1;
-                    break;
-
-                default:
-                    mips = 2_500L;
-                    pes = 1;
-                    break;
+                sum += value;
             }
 
-            long ram =
-                    16_384L;
-
-            long bw =
-                    50_000L;
-
-            long size =
-                    10_000L;
-
-            Vm vm =
-                    new VmSimple(
-                            vmId,
-                            mips,
-                            pes);
-
-            vm.setRam(ram);
-            vm.setBw(bw);
-            vm.setSize(size);
-
-            vmList.add(vm);
-        }
-
-        return vmList;
-    }
-
-    /*
-     * ============================================================
-     * CREATE DYNAMIC CLOUDLETS
-     * ============================================================
-     */
-
-    private static List<Cloudlet>
-    createDynamicCloudlets(
-            int numTasks) {
-
-        List<Cloudlet> cloudletList =
-                new ArrayList<>(
-                        numTasks);
-
-        Random random =
-                new Random(
-                        RANDOM_SEED
-                                + numTasks);
-
-        UtilizationModelDynamic cpuUtilization =
-                new UtilizationModelDynamic(
-                        0.8);
-
-        UtilizationModelDynamic ramUtilization =
-                new UtilizationModelDynamic(
-                        0.05);
-
-        UtilizationModelDynamic bwUtilization =
-                new UtilizationModelDynamic(
-                        0.05);
-
-        for (int i = 0;
-             i < numTasks;
-             i++) {
-
-            /*
-             * Cloudlet length:
-             *
-             * 10,000 to 800,000 MI.
-             */
-            long length =
-                    10_000L
-                            + (long)
-                            (random.nextDouble()
-                                    * 790_001L);
-
-            Cloudlet cloudlet =
-                    new CloudletSimple(
-                            i,
-                            length,
-                            1);
-
-            cloudlet
-                    .setUtilizationModelCpu(
-                            cpuUtilization);
-
-            cloudlet
-                    .setUtilizationModelRam(
-                            ramUtilization);
-
-            cloudlet
-                    .setUtilizationModelBw(
-                            bwUtilization);
-
-            /*
-             * Dynamic submission delay.
-             */
-            cloudlet.setSubmissionDelay(
-                    (i / 100.0) * 0.5);
-
-            cloudletList.add(
-                    cloudlet);
-        }
-
-        return cloudletList;
-    }
-
-    private static class UtilizationMetrics {
-
-        private final double averageUtilization;
-
-        private final double degreeOfImbalance;
-
-        private UtilizationMetrics(
-                double averageUtilization,
-                double degreeOfImbalance) {
-
-            this.averageUtilization =
-                    averageUtilization;
-
-            this.degreeOfImbalance =
-                    degreeOfImbalance;
+            return sum /
+                    values.size();
         }
     }
 }

@@ -2,9 +2,23 @@ package org.cloudsimplus.examples;
 
 import java.util.Arrays;
 
+/**
+ * State representation used by the Double-DQN load-balancing agent.
+ *
+ * Features:
+ *
+ * 0 -> Mean VM CPU utilization
+ * 1 -> VM CPU utilization standard deviation
+ * 2 -> Waiting Cloudlet queue load
+ * 3 -> Normalized remaining system workload
+ * 4 -> Normalized energy rate
+ * 5 -> Normalized cost rate
+ * 6 -> Normalized incoming Cloudlet workload
+ * 7 -> Normalized workload imbalance
+ */
 public class DqnState {
 
-    public static final int STATE_DIM = 6;
+    public static final int STATE_DIM = 8;
 
     private final double[] features;
 
@@ -14,7 +28,9 @@ public class DqnState {
             double queueLoad,
             double remainingWorkload,
             double energyRate,
-            double costRate) {
+            double costRate,
+            double incomingWorkload,
+            double workloadImbalance) {
 
         features = new double[]{
                 clamp(meanUtilization),
@@ -22,11 +38,14 @@ public class DqnState {
                 clamp(queueLoad),
                 clamp(remainingWorkload),
                 clamp(energyRate),
-                clamp(costRate)
+                clamp(costRate),
+                clamp(incomingWorkload),
+                clamp(workloadImbalance)
         };
     }
 
     public double getFeature(int index) {
+
         if (index < 0 || index >= STATE_DIM) {
             throw new IllegalArgumentException(
                     "Invalid feature index: " + index);
@@ -54,7 +73,9 @@ public class DqnState {
 
         return Math.max(
                 0.0,
-                Math.min(1.0, value));
+                Math.min(
+                        1.0,
+                        value));
     }
 
     @Override
